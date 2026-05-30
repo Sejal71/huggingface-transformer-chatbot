@@ -4,9 +4,9 @@ import shutil
 import os
 import re
 import random
+import uvicorn
 
 from rag import extract_text_from_pdf, create_vector_store, search_similar_chunks, list_indexed_pdfs
-from model import generate_answer
 
 GREETINGS = {
     "greet": {
@@ -41,9 +41,9 @@ GREETINGS = {
         "responses": [
             (
                 "I'm a PDF Q&A assistant! Here's what I can do:\n\n"
-                "📄 **Upload PDFs** — Send me any PDF document to index.\n"
-                "❓ **Answer Questions** — Ask anything about the content of your uploaded PDFs.\n"
-                "📚 **Multi-document** — I can handle multiple PDFs at once and tell you which one the answer came from.\n\n"
+                "Upload PDFs — Send me any PDF document to index.\n"
+                "Answer Questions — Ask anything about the content of your uploaded PDFs.\n"
+                "Multi-document — I can handle multiple PDFs at once and tell you which one the answer came from.\n\n"
                 "Just upload a PDF and start asking questions!"
             ),
         ],
@@ -80,6 +80,7 @@ def get_casual_response(text: str):
                 return random.choice(data["responses"])
     return None
 
+
 app = FastAPI()
 
 app.add_middleware(
@@ -93,18 +94,75 @@ app.add_middleware(
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+MIN_SIMILARITY = 0.55
 
-def extract_answer_text(chunk):
+
+def _clean_chunk(chunk: str) -> str:
+    """Strip leading Q line from Q&A chunks; return section text as-is."""
     lines = chunk.strip().split("\n")
-    answer_lines = []
-    past_question = False
+    result = []
+    skipped_q = False
     for line in lines:
-        if not past_question and re.match(r'^Q\d*[\.:]?\s', line, re.IGNORECASE):
-            past_question = True
+        if not skipped_q and re.match(r'^Q\d*[\.:]?\s', line, re.IGNORECASE):
+            skipped_q = True
             continue
         if line.strip():
-            answer_lines.append(line.strip())
-    return " ".join(answer_lines) if answer_lines else chunk
+            result.append(line.strip())
+    return "\n".join(result) if result else chunk
+
+
+def _is_qa_chunk(chunk: str) -> bool:
+    """True when the chunk is a single Q&A pair (not a document section)."""
+    return bool(re.search(r'^Q\d*[\.:]?\s', chunk, re.IGNORECASE | re.MULTILINE))
+
+
+_FACT_STOPWORDS = {
+    "what", "is", "the", "in", "my", "of", "a", "an", "are", "tell", "me",
+    "about", "who", "when", "where", "how", "which", "give", "show", "find",
+    "document", "proposal", "pdf", "file", "for", "to", "from", "with",
+    "it", "its", "this", "that", "and", "or", "no", "not", "was", "were",
+}
+
+
+def _focused_answer(chunk: str, question: str) -> str:
+    """For keyword-matched chunks, return just the relevant snippet instead of the whole chunk."""
+    terms = [
+        w for w in re.findall(r'\b[a-zA-Z0-9]+\b', question.lower())
+        if w not in _FACT_STOPWORDS and len(w) > 2
+    ]
+    if not terms:
+        return chunk
+
+    for term in terms:
+        # Find "LABEL ... : " prefix
+        m_label = re.search(rf'(?i)\b{re.escape(term)}\b[^:\n]{{0,15}}:\s*', chunk)
+        if m_label:
+            remaining = chunk[m_label.end():]
+            value_words = []
+            for w in remaining.split():
+                if w == "•":
+                    break
+                # Stop at the next field label (word ending with ":" or ALL-CAPS short token)
+                if value_words and (w.endswith(":") or (w.isupper() and len(w) > 1 and w.isalpha())):
+                    break
+                value_words.append(w)
+                # Numeric IDs are single tokens — stop immediately after
+                if re.match(r'^\d+$', w):
+                    break
+            if value_words:
+                label = m_label.group(0).strip()
+                return f"{label} {' '.join(value_words)}"
+
+    # Fallback: return a small word-window starting at the first matched term
+    words = chunk.split()
+    words_lower = [w.lower() for w in words]
+    for term in terms:
+        for i, w in enumerate(words_lower):
+            if term in w:
+                end = min(len(words), i + 10)
+                return " ".join(words[i:end])
+
+    return chunk
 
 
 @app.get("/")
@@ -132,29 +190,58 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.post("/ask-document")
 async def ask_document(data: dict):
-    question = data.get("question")
+    question = data.get("question", "").strip()
+
+    # Handle greetings and casual queries without touching the vector store
+    casual = get_casual_response(question)
+    if casual:
+        return {"answer": casual, "similarity_scores": [], "sources": []}
+
     results = search_similar_chunks(question)
 
     if not results:
         return {
-            "answer": "I couldn't find relevant information about this in the uploaded documents. Please try rephrasing or ask something covered in the document.",
+            "answer": "I couldn't find relevant information about this in the uploaded documents. Please try rephrasing your question.",
             "similarity_scores": [],
             "sources": [],
         }
 
     top_score = results[0]["similarity"]
-    if top_score < 0.5:
+    if top_score < MIN_SIMILARITY:
         return {
-            "answer": "Your question doesn't seem to be covered in the uploaded documents. Please ask something related to the document content.",
+            "answer": (
+                f"I couldn't find a confident match in your documents (best score: {top_score:.0%}). "
+                "Try rephrasing or ask something more specific to the document content."
+            ),
             "similarity_scores": [r["similarity"] for r in results],
             "sources": [],
         }
 
-    answer_text = extract_answer_text(results[0]["chunk"])
-    answer = generate_answer(answer_text, question)
+    top_result = results[0]
+    top_chunk = top_result["chunk"]
+    match_type = top_result.get("match_type", "semantic")
+
+    if _is_qa_chunk(top_chunk):
+        # Single Q&A pair — never merge sibling pairs
+        answer = _clean_chunk(top_chunk)
+    elif match_type == "keyword":
+        # Specific fact lookup (PRN No., college name, etc.) — extract just the snippet
+        answer = _focused_answer(top_chunk, question)
+    else:
+        # Section / semantic — only combine chunks from the same section heading
+        top_heading = top_chunk.split("\n")[0].strip().lower()
+        same_section = [
+            r for r in results
+            if r["chunk"].split("\n")[0].strip().lower() == top_heading
+        ]
+        answer = "\n\n".join(_clean_chunk(r["chunk"]) for r in same_section)
 
     return {
         "answer": answer,
         "similarity_scores": [r["similarity"] for r in results],
         "sources": [r["pdf_name"] for r in results],
     }
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
